@@ -13,6 +13,7 @@ st.title("🛡️ App-ads.txt Health & Line Counter")
 st.markdown("""
 Этот инструмент проверяет наличие файла **app-ads.txt**, обрабатывает редиректы, 
 игнорирует HTML-страницы ошибок (Soft 404) и считает количество валидных строк.
+**Результаты выводятся в том же порядке, что и в вашем списке.**
 """)
 
 # ---------------- Input Tabs ----------------
@@ -21,7 +22,7 @@ tab1, tab2 = st.tabs(["📋 Вставить список", "📂 Загрузи
 domains = []
 with tab1:
     st.header("Список доменов")
-    domain_input = st.text_area("Вставьте домены (один на строку, например: site.com)", height=200)
+    domain_input = st.text_area("Вставьте домены (один на строку)", height=200)
     if domain_input:
         domains = [d.strip() for d in domain_input.splitlines() if d.strip()]
 
@@ -33,16 +34,17 @@ with tab2:
         uploaded_domains = [line.strip() for line in stringio.readlines() if line.strip()]
         domains.extend(uploaded_domains)
 
-# Deduplicate
+# Deduplicate preserving order (Python 3.7+ dict preserves insertion order)
 domains = list(dict.fromkeys(domains))
+
 if domains:
     st.info(f"✅ Загружено уникальных доменов: {len(domains)}")
 
 # ---------------- Settings Sidebar ----------------
 st.sidebar.header("⚙️ Настройки")
 
-timeout_sec = st.sidebar.slider("Тайм-аут запроса (сек)", 3, 20, 8)
-max_threads = st.sidebar.slider("Количество потоков", 5, 50, 20)
+timeout_sec = st.sidebar.slider("Тайм-аут запроса (сек)", 3, 20, 5)
+max_threads = st.sidebar.slider("Количество потоков", 5, 50, 30)
 ua_mode = st.sidebar.radio("Режим User-Agent", ["Chrome (Windows)", "Google Bot"])
 
 if ua_mode == "Chrome (Windows)":
@@ -59,27 +61,23 @@ def clean_domain(raw_url):
         raw_url = "http://" + raw_url
     try:
         parsed = urlparse(raw_url)
-        # Возвращаем netloc (домен) + path (если сайт в папке), но без лишних слешей
         return parsed.netloc + parsed.path.rstrip('/')
     except:
         return raw_url
 
 def analyze_content(text):
-    """Анализирует текст файла: считает строки, ищет HTML мусор."""
+    """Анализирует текст файла."""
     if not text:
         return 0, "Empty File"
     
-    # Проверка на Soft 404 (HTML вместо текста)
-    text_lower = text.lower()[:500] # Смотрим только начало файла для скорости
+    text_lower = text.lower()[:500] 
     if "<!doctype html" in text_lower or "<html" in text_lower or "<body" in text_lower or "<div" in text_lower:
         return 0, "Soft 404 (HTML)"
 
-    # Считаем реальные строки (не пустые, не комментарии)
     lines = text.splitlines()
     valid_count = 0
     for line in lines:
         line = line.strip()
-        # Игнорируем пустые строки и комментарии
         if line and not line.startswith('#'):
             valid_count += 1
     
@@ -88,17 +86,19 @@ def analyze_content(text):
     
     return valid_count, "Valid"
 
-def check_domain(domain):
-    """Основная функция проверки одного домена."""
+def check_domain(domain, index):
+    """
+    Проверка домена.
+    Аргумент index нужен, чтобы запомнить порядковый номер.
+    """
     clean_d = clean_domain(domain)
-    # Формируем целевой URL
     target_url = f"https://{clean_d}/app-ads.txt"
-    # Если не сработает HTTPS, попробуем HTTP внутри сессии, но начнем с HTTPS
     
     session = requests.Session()
     session.headers.update({'User-Agent': USER_AGENT})
     
     result = {
+        "Index": index, # Сохраняем исходный номер строки
         "Input Domain": domain,
         "Final URL": target_url,
         "Status": "Unknown",
@@ -110,25 +110,24 @@ def check_domain(domain):
         # Попытка 1: HTTPS
         response = session.get(target_url, timeout=timeout_sec, allow_redirects=True)
     except requests.exceptions.SSLError:
-        # Попытка 2: Если SSL ошибка, пробуем без верификации
+        # Попытка 2: HTTPS без проверки сертификата
         try:
             response = session.get(target_url, timeout=timeout_sec, allow_redirects=True, verify=False)
-        except Exception as e:
-             # Попытка 3: Пробуем HTTP если совсем плохо
+        except Exception:
+             # Попытка 3: HTTP
             try:
                 target_url_http = f"http://{clean_d}/app-ads.txt"
                 response = session.get(target_url_http, timeout=timeout_sec, allow_redirects=True)
                 result["Final URL"] = response.url
-            except Exception as e_final:
+            except Exception:
                 result["Status"] = "Connection Error"
                 result["Code"] = "ERR"
                 return result
-    except Exception as e:
+    except Exception:
         result["Status"] = "Connection Error"
         result["Code"] = "ERR"
         return result
 
-    # Обработка ответа
     result["Code"] = response.status_code
     result["Final URL"] = response.url
 
@@ -154,15 +153,15 @@ if st.button("🚀 Начать проверку", disabled=not domains):
     progress_bar = st.progress(0)
     status_text = st.empty()
     
-    # Многопоточная обработка
+    # Запускаем потоки, передавая индекс (i)
     with ThreadPoolExecutor(max_workers=max_threads) as executor:
-        future_to_domain = {executor.submit(check_domain, d): d for d in domains}
+        # Передаем enumerate(domains), чтобы у каждого домена был свой номер (0, 1, 2...)
+        future_to_domain = {executor.submit(check_domain, d, i): d for i, d in enumerate(domains)}
         
         for i, future in enumerate(as_completed(future_to_domain)):
             data = future.result()
             results_data.append(data)
             
-            # Обновление прогресса
             percent = (i + 1) / len(domains)
             progress_bar.progress(percent)
             status_text.text(f"Обработано {i + 1} из {len(domains)}...")
@@ -173,23 +172,27 @@ if st.button("🚀 Начать проверку", disabled=not domains):
     # ---------------- Display Results ----------------
     df = pd.DataFrame(results_data)
     
-    # Сортировка: Сначала Valid, потом ошибки
-    df = df.sort_values(by=["Lines"], ascending=False)
-    
-    # Визуальное оформление таблицы
+    # === ВАЖНО: Сортируем обратно по индексу ===
+    if not df.empty:
+        df = df.sort_values(by=["Index"], ascending=True)
+        # Удаляем колонку Index, чтобы она не мешалась в таблице (опционально, но так красивее)
+        df_display = df.drop(columns=["Index"]) 
+    else:
+        df_display = df
+
     def highlight_status(val):
         color = 'black'
         if val == 'Valid':
             color = 'green'
-        elif val == 'Not Found' or val == 'Empty File':
+        elif val == 'Not Found' or val == 'Empty File' or val == 'Connection Error':
             color = 'red'
-        elif 'Soft 404' in val:
+        elif 'Soft 404' in val or 'Forbidden' in val:
             color = 'orange'
         return f'color: {color}; font-weight: bold'
 
     st.subheader("📊 Результаты проверки")
     st.dataframe(
-        df.style.map(highlight_status, subset=['Status']),
+        df_display.style.map(highlight_status, subset=['Status']),
         use_container_width=True,
         column_config={
             "Final URL": st.column_config.LinkColumn("Ссылка на файл"),
@@ -198,7 +201,8 @@ if st.button("🚀 Начать проверку", disabled=not domains):
     )
 
     # ---------------- Export ----------------
-    csv = df.to_csv(index=False).encode('utf-8')
+    # Для CSV берем отсортированный фрейм, но без колонки Index
+    csv = df_display.to_csv(index=False).encode('utf-8')
     st.download_button(
         label="📥 Скачать отчет (CSV)",
         data=csv,
